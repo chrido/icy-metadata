@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +12,9 @@ struct Fragmented {
 
 impl Read for Fragmented {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() { return Ok(0); }
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if let Some((position, kind)) = self.fault {
             if self.inner.position() as usize == position {
                 self.fault = None;
@@ -27,6 +29,60 @@ impl Read for Fragmented {
     }
 }
 
+impl Seek for Fragmented {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+#[test]
+fn partial_metadata_position_queries_and_seek_rejection_preserve_state() {
+    let input = Fragmented {
+        inner: Cursor::new(wire(1)),
+        maximum: 3,
+        fault: Some((8, io::ErrorKind::WouldBlock)),
+    };
+    let mut reader = IcyMetadataReader::new(input, NonZeroUsize::new(4), |value| {
+        assert_eq!(value.unwrap().stream_title(), Some("x"));
+    });
+    let mut first = [0; 4];
+    reader.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"abcd");
+    assert_eq!(
+        reader.read(&mut [0; 32]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(reader.stream_position().unwrap(), 4);
+    assert_eq!(
+        reader.seek(SeekFrom::Start(0)).unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    let mut rest = Vec::new();
+    reader.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"efghij");
+    assert_eq!(reader.stream_position().unwrap(), 10);
+}
+
+#[test]
+fn temporary_metadata_error_during_forward_seek_can_resume_reading() {
+    let input = Fragmented {
+        inner: Cursor::new(wire(1)),
+        maximum: 3,
+        fault: Some((8, io::ErrorKind::WouldBlock)),
+    };
+    let mut reader = IcyMetadataReader::new(input, NonZeroUsize::new(4), |value| {
+        assert_eq!(value.unwrap().stream_title(), Some("x"));
+    });
+    assert_eq!(
+        reader.seek(SeekFrom::Start(6)).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(reader.stream_position().unwrap(), 4);
+    let mut audio = Vec::new();
+    reader.read_to_end(&mut audio).unwrap();
+    assert_eq!(audio, b"efghij");
+}
+
 fn wire(units: u8) -> Vec<u8> {
     let mut data = b"abcd".to_vec();
     data.push(units);
@@ -39,12 +95,19 @@ fn wire(units: u8) -> Vec<u8> {
     data
 }
 
-fn run(data: Vec<u8>, maximum: usize, caller: usize, fault: Option<(usize, io::ErrorKind)>)
-    -> (Vec<u8>, usize)
-{
+fn run(
+    data: Vec<u8>,
+    maximum: usize,
+    caller: usize,
+    fault: Option<(usize, io::ErrorKind)>,
+) -> (Vec<u8>, usize) {
     let events = Arc::new(Mutex::new(0));
     let callback = events.clone();
-    let input = Fragmented { inner: Cursor::new(data), maximum, fault };
+    let input = Fragmented {
+        inner: Cursor::new(data),
+        maximum,
+        fault,
+    };
     let mut reader = IcyMetadataReader::new(input, NonZeroUsize::new(4), move |metadata| {
         assert_eq!(metadata.unwrap().stream_title(), Some("x"));
         *callback.lock().unwrap() += 1;
@@ -56,7 +119,14 @@ fn run(data: Vec<u8>, maximum: usize, caller: usize, fault: Option<(usize, io::E
         match reader.read(&mut buf) {
             Ok(0) => return (output, *events.lock().unwrap()),
             Ok(count) => output.extend_from_slice(&buf[..count]),
-            Err(error) if matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) => (),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(error) => panic!("framing error: {error}; audio={output:?}"),
         }
     }
@@ -98,12 +168,18 @@ fn i04_temporary_errors_preserve_partial_metadata_and_audio() {
 #[test]
 fn i05_truncated_metadata_is_not_eof_and_prior_audio_is_returned() {
     for cut in 4..21 {
-        let mut reader = IcyMetadataReader::new(Cursor::new(wire(1)[..cut].to_vec()),
-            NonZeroUsize::new(4), |_| panic!("truncated block emitted metadata"));
+        let mut reader = IcyMetadataReader::new(
+            Cursor::new(wire(1)[..cut].to_vec()),
+            NonZeroUsize::new(4),
+            |_| panic!("truncated block emitted metadata"),
+        );
         let mut buf = [0; 64];
         assert_eq!(reader.read(&mut buf).unwrap(), 4);
         assert_eq!(&buf[..4], b"abcd");
-        assert_eq!(reader.read(&mut buf).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            reader.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 }
 
@@ -113,10 +189,11 @@ fn i07_invalid_metadata_text_does_not_corrupt_audio() {
     data[5] = 255;
     let errors = Arc::new(Mutex::new(0));
     let callback = errors.clone();
-    let mut reader = IcyMetadataReader::new(Cursor::new(data), NonZeroUsize::new(4), move |value| {
-        assert!(value.is_err());
-        *callback.lock().unwrap() += 1;
-    });
+    let mut reader =
+        IcyMetadataReader::new(Cursor::new(data), NonZeroUsize::new(4), move |value| {
+            assert!(value.is_err());
+            *callback.lock().unwrap() += 1;
+        });
     let mut audio = Vec::new();
     reader.read_to_end(&mut audio).unwrap();
     assert_eq!(audio, b"abcdefghij");
